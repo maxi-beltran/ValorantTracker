@@ -17,8 +17,8 @@ Los datos vienen de la [API de HenrikDev](https://docs.henrikdev.xyz/) a través
 Requiere **Python 3.10+**.
 
 ```bash
-git clone https://github.com/<tu-usuario>/valorant-tracker.git
-cd valorant-tracker
+git clone https://github.com/maxi-beltran/ValorantTracker.git
+cd ValorantTracker
 pip install -r requirements-desktop.txt
 python valorant_tracker.py
 ```
