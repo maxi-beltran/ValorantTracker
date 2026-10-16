@@ -1,8 +1,17 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/proxy.py": {
       "maxDuration": 15
     }
-  }
+  },
+  "rewrites": [
+    {
+      "source": "/api/proxy",
+      "destination": "/api/proxy.py"
+    },
+    {
+      "source": "/",
+      "destination": "/api/proxy.py"
+    }
+  ]
 }
