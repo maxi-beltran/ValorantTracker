@@ -5,6 +5,7 @@ venv/
 .env
 .env.*
 .vercel/
+.cache_tracker/
 dist/
 build/
 *.spec
