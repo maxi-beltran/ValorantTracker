@@ -61,10 +61,6 @@ def fetch_henrik(endpoint: str, api_key: str, timeout: int = 12):
 
 
 def compact_matches_payload(payload: dict) -> dict:
-    """
-    Extrae 3k, 4k, Ace y KAST aproximado de las rondas y elimina los arrays
-    gigantes de coordenadas ('rounds' y 'kills') para reducir el peso un 98%.
-    """
     if not isinstance(payload, dict) or "data" not in payload:
         return payload
 
@@ -80,7 +76,6 @@ def compact_matches_payload(payload: dict) -> dict:
         rounds = match.get("rounds") or []
         all_players = match.get("players", {}).get("all_players", [])
 
-        # Calcular multikills (2k, 3k, 4k, 5k/Ace) por jugador en cada ronda
         multikills_by_puuid = {}
         rounds_with_contribution = {}
 
@@ -147,11 +142,15 @@ def compact_matches_payload(payload: dict) -> dict:
 
 class handler(BaseHTTPRequestHandler):
     def _send_json(self, status_code: int, data: dict, cache_seconds: int = 60):
-        raw_bytes = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        raw_bytes = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         accept_enc = self.headers.get("Accept-Encoding", "")
 
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
         if status_code == 200 and cache_seconds > 0:
             self.send_header(
                 "Cache-Control",
@@ -169,16 +168,34 @@ class handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw_bytes)
 
-    def do_GET(self):
-        api_key = os.environ.get("VALORANT_API_KEY", "").strip()
-        if not api_key:
-            self._send_json(500, {"error": "VALORANT_API_KEY no configurada en Vercel"}, 0)
-            return
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
 
+    def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed_path.query)
 
-        # MODO BATCH ULTRA RÁPIDO: Pide MMR + Matches en paralelo dentro de Vercel
+        # Healthcheck si acceden directamente a la URL del proxy sin parámetros
+        if not query or (not query.get("endpoint") and not query.get("batch")):
+            self._send_json(200, {
+                "status": "online",
+                "message": "Valorant Proxy is running",
+                "version": "2.0"
+            }, 0)
+            return
+
+        api_key = os.environ.get("VALORANT_API_KEY", "").strip()
+        if not api_key:
+            self._send_json(500, {
+                "error": "VALORANT_API_KEY no configurada en las variables de entorno de Vercel"
+            }, 0)
+            return
+
+        # Modo Batch ultra rápido
         if query.get("batch", [""])[0] == "1":
             region = query.get("region", ["latam"])[0].strip().lower()
             name = urllib.parse.quote(query.get("name", [""])[0].strip())
@@ -216,7 +233,7 @@ class handler(BaseHTTPRequestHandler):
             )
             return
 
-        # MODO CLÁSICO POR ENDPOINT (retrocompatible)
+        # Modo Clásico por Endpoint
         endpoint = query.get("endpoint", [""])[0]
         if not is_valid_endpoint(endpoint):
             self._send_json(403, {"error": "Endpoint inválido o no permitido"}, 0)
