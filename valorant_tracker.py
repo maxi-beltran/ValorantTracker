@@ -1458,6 +1458,26 @@ class TrackerLocalHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+APP_WINDOW_WIDTH = 1060
+APP_WINDOW_HEIGHT = 880
+
+
+def _fitted_window_geometry():
+    """Tamano justo para la app, centrado y sin exceder la pantalla."""
+    width, height = APP_WINDOW_WIDTH, APP_WINDOW_HEIGHT
+    screen_w, screen_h = 1920, 1080
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        screen_w = user32.GetSystemMetrics(0)
+        screen_h = user32.GetSystemMetrics(1)
+    except Exception:
+        pass
+    width = min(width, screen_w - 40)
+    height = min(height, screen_h - 80)
+    return width, height, max((screen_w - width) // 2, 0), max((screen_h - height) // 2 - 20, 0)
+
+
 def open_native_app_window(url: str):
     candidates = [
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -1465,10 +1485,20 @@ def open_native_app_window(url: str):
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     ]
+    width, height, pos_x, pos_y = _fitted_window_geometry()
+    profile_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ValorantTrackerApp")
     for browser_path in candidates:
         if os.path.exists(browser_path):
             try:
-                subprocess.Popen([browser_path, f"--app={url}", "--window-size=1150,800"])
+                subprocess.Popen([
+                    browser_path,
+                    f"--app={url}",
+                    f"--user-data-dir={profile_dir}",
+                    f"--window-size={width},{height}",
+                    f"--window-position={pos_x},{pos_y}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ])
                 return
             except Exception:
                 pass
