@@ -51,6 +51,7 @@ class ValorantLiveEngine:
         self.puuid_name_cache = {}
         self.player_stats_cache = {}
         self.profile_cache = {}
+        self.region_cache = {}
 
         self.executor.submit(self._load_valorant_static_data)
 
@@ -383,8 +384,42 @@ class ValorantLiveEngine:
         except Exception:
             return default_stats
 
-    def search_player_profile(self, region: str, name: str, tag: str, mode: str = "competitive") -> dict:
+    ALL_REGIONS = ("latam", "na", "br", "eu", "ap", "kr")
+
+    def _detect_region(self, name: str, tag: str):
+        """Detecta la region de una cuenta sin que el usuario la elija. Devuelve (region, error)."""
+        safe_name = quote(name, safe="")
+        safe_tag = quote(tag, safe="")
+
+        r = self._call_proxy(f"/valorant/v1/account/{safe_name}/{safe_tag}", 12)
+        if r is not None:
+            try:
+                j = r.json()
+            except Exception:
+                j = {}
+            if r.status_code == 200:
+                reg = ((j.get("data") or {}).get("region") or "").lower()
+                if reg:
+                    return reg, None
+            elif isinstance(j, dict) and j.get("error") and r.status_code in (403, 500):
+                err = str(j.get("error"))
+                if "Deployment Protection" in err or "VALORANT_API_KEY" in err:
+                    return None, err
+
+        # Respaldo: probar el MMR en todas las regiones en paralelo
+        def probe(reg):
+            rr = self._call_proxy(f"/valorant/v2/mmr/{reg}/{safe_name}/{safe_tag}", 10)
+            return reg if (rr is not None and rr.status_code == 200) else None
+
+        for found in self.executor.map(probe, self.ALL_REGIONS):
+            if found:
+                return found, None
+        return None, f"No se encontro al jugador '{name}#{tag}'."
+
+    def search_player_profile(self, region: str, name: str, tag: str, mode: str = "all") -> dict:
         name, tag = name.strip(), tag.strip()
+        mode = (mode or "all").strip().lower()
+        region = (region or "auto").strip().lower()
         if not name or not tag:
             return {"error": "Debes ingresar un Nombre#TAG valido."}
 
@@ -397,34 +432,33 @@ class ValorantLiveEngine:
         safe_name = quote(name, safe="")
         safe_tag = quote(tag, safe="")
 
-        # Usar siempre endpoints 100% compatibles con el filtro estricto de Vercel
+        if region in ("", "auto"):
+            region_key = f"{name.lower()}#{tag.lower()}"
+            region = self.region_cache.get(region_key)
+            if not region:
+                region, err = self._detect_region(name, tag)
+                if not region:
+                    return {"error": err or f"No se encontro al jugador '{name}#{tag}'."}
+                self.region_cache[region_key] = region
+
         mmr_ep = f"/valorant/v2/mmr/{region}/{safe_name}/{safe_tag}"
-        mat_ep_comp = f"/valorant/v3/matches/{region}/{safe_name}/{safe_tag}?mode=competitive&size=10"
-        mat_ep_custom = (
-            f"/valorant/v3/matches/{region}/{safe_name}/{safe_tag}?size=10"
-            if mode == "all"
-            else f"/valorant/v3/matches/{region}/{safe_name}/{safe_tag}?mode={mode}&size=10"
-        )
+        mode_param = "" if mode == "all" else f"&mode={quote(mode, safe='')}"
+        mat_ep = f"/valorant/v3/matches/{region}/{safe_name}/{safe_tag}?size=10{mode_param}"
 
         f_mmr = self.executor.submit(self._call_proxy, mmr_ep, 15)
-        f_mat = self.executor.submit(self._call_proxy, mat_ep_custom, 15)
-
+        f_mat = self.executor.submit(self._call_proxy, mat_ep, 15)
         r_mmr = f_mmr.result()
         r_mat = f_mat.result()
 
-        # Si el proxy de Vercel rechazo mode!=competitive (403), hacer fallback automatico a competitive
-        if (r_mat is None or r_mat.status_code == 403) and mat_ep_custom != mat_ep_comp:
-            r_mat = self._call_proxy(mat_ep_comp, 15)
-
         if r_mmr is None and r_mat is None:
-            return {"error": "No se pudo conectar con el servidor Proxy de Vercel (Revisa que tu proyecto esté desplegado o que no devuelva 404)."}
+            return {"error": "No se pudo conectar con el servidor Proxy de Vercel (Revisa que tu proyecto este desplegado)."}
 
         for resp in (r_mmr, r_mat):
             if resp is not None:
                 try:
                     j = resp.json()
                     if isinstance(j, dict) and "error" in j:
-                        err_msg = j.get("error")
+                        err_msg = str(j.get("error"))
                         if "Deployment Protection" in err_msg or "VALORANT_API_KEY" in err_msg:
                             return {"error": err_msg}
                 except Exception:
@@ -433,18 +467,6 @@ class ValorantLiveEngine:
         mmr_code = r_mmr.status_code if r_mmr is not None else 500
         mat_code = r_mat.status_code if r_mat is not None else 500
 
-        # Si no aparece en LATAM, probar automaticamente en NA o BR por si la cuenta fue creada en otro shard
-        if mmr_code == 404 and mat_code == 404 and region == "latam":
-            for alt_reg in ("na", "br"):
-                r_alt = self._call_proxy(f"/valorant/v2/mmr/{alt_reg}/{safe_name}/{safe_tag}", 10)
-                if r_alt is not None and r_alt.status_code == 200:
-                    region = alt_reg
-                    r_mmr = r_alt
-                    mmr_code = 200
-                    r_mat = self._call_proxy(f"/valorant/v3/matches/{alt_reg}/{safe_name}/{safe_tag}?mode=competitive&size=10", 12)
-                    mat_code = r_mat.status_code if r_mat is not None else 404
-                    break
-
         if mmr_code == 404 and mat_code == 404:
             return {"error": f"No se encontro al jugador '{name}#{tag}' en {region.upper()}."}
 
@@ -452,6 +474,7 @@ class ValorantLiveEngine:
         matches_data = r_mat.json().get("data", []) if (r_mat is not None and mat_code == 200) else []
 
         result = self._format_profile_response(name, tag, region, mmr_data, matches_data, time.time() - t0)
+        result["mode"] = mode
         self.profile_cache[cache_key] = (time.time(), result)
         return result
 
@@ -706,6 +729,11 @@ HTML_UI = """<!DOCTYPE html>
     padding: 16px 18px; position: relative; margin-bottom: 14px;
   }
   .search-row { display: flex; align-items: center; gap: 10px; }
+  .mode-filter { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 4px 14px; }
+  .mf-label { font-size: 11px; font-weight: 800; letter-spacing: 1px; color: var(--muted); margin-right: 4px; }
+  .mf-chip { background: #111a2b; color: #cbd5e1; border: 1px solid #1e293b; border-radius: 999px; padding: 6px 14px; font-size: 12px; font-weight: 700; cursor: pointer; transition: all .15s ease; font-family: inherit; }
+  .mf-chip:hover { border-color: #ff4655; color: #fff; transform: translateY(-1px); }
+  .mf-chip.active { background: #ff4655; border-color: #ff4655; color: #fff; }
   .find-title { font-size: 16px; font-weight: 900; letter-spacing: 0.5px; margin-right: 6px; }
   select.ctrl {
     background: #192231; color: #fff; border: 1px solid #2b3952; border-radius: 7px;
@@ -894,21 +922,8 @@ HTML_UI = """<!DOCTYPE html>
     <div class="search-panel">
       <div class="search-row">
         <div class="find-title">FIND PLAYERS</div>
-        <select class="ctrl" id="selRegion">
-          <option value="latam">LATAM</option>
-          <option value="br">BR</option>
-          <option value="na">NA</option>
-          <option value="eu">EU</option>
-          <option value="ap">AP</option>
-          <option value="kr">KR</option>
-        </select>
-        <select class="ctrl" id="selMode" onchange="retriggerSearch()">
-          <option value="competitive">Competitivo</option>
-          <option value="all">Todos los Modos</option>
-          <option value="swiftplay">Swiftplay</option>
-          <option value="unrated">Normal</option>
-          <option value="deathmatch">Deathmatch</option>
-        </select>
+        <input type="hidden" id="selRegion" value="auto">
+        <input type="hidden" id="selMode" value="all">
         <div class="input-wrap">
           <span class="riot-badge">RIOT ID</span>
           <input type="text" id="inpRiotId" placeholder="Ingresa Nombre#TAG (ej. EL LUIS#1069)..."
@@ -934,6 +949,8 @@ HTML_UI = """<!DOCTYPE html>
     <div id="searchStatus" style="font-size:12.5px; font-weight:600; color:var(--muted); margin: 6px 4px 12px;">
       Ingresa cualquier Nombre#TAG o selecciona "Ver Historial" desde la pestaña de partida en vivo.
     </div>
+
+    <div class="mode-filter" id="modeFilter" style="display:none;"></div>
 
     <div class="stats-grid" id="summaryGrid" style="display:none;">
       <div class="stat-card">
@@ -1049,7 +1066,7 @@ function renderDropdown() {
       }
     });
     if (q.includes('#') && !seen.has(q)) {
-      items.unshift({riot_id: document.getElementById('inpRiotId').value.trim(), region: document.getElementById('selRegion').value});
+      items.unshift({riot_id: document.getElementById('inpRiotId').value.trim(), region: 'auto'});
     }
   }
 
@@ -1079,13 +1096,36 @@ function renderDropdown() {
 function loadPlayerFromList(riotId, region) {
   if (!riotId || !riotId.includes('#')) return;
   switchMainView('search');
-  document.getElementById('selRegion').value = region || 'latam';
+  document.getElementById('selRegion').value = 'auto';
   document.getElementById('inpRiotId').value = riotId;
   closeDropdown();
-  runProfileSearch();
+  runProfileSearch(true);
 }
-function retriggerSearch() {
-  if (document.getElementById('inpRiotId').value.includes('#')) runProfileSearch();
+
+const MODE_OPTIONS = [
+  ['all', 'Todos'],
+  ['competitive', 'Competitivo'],
+  ['swiftplay', 'Swiftplay'],
+  ['unrated', 'Normal'],
+  ['spikerush', 'Spike Rush'],
+  ['deathmatch', 'Deathmatch'],
+  ['escalation', 'Escalation'],
+  ['replication', 'Replication'],
+];
+
+function renderModeFilter() {
+  let cur = document.getElementById('selMode').value;
+  let box = document.getElementById('modeFilter');
+  box.style.display = 'flex';
+  box.innerHTML = `<span class="mf-label">MODO</span>` + MODE_OPTIONS.map(([v, label]) =>
+    `<button class="mf-chip ${v === cur ? 'active' : ''}" onclick="setModeFilter('${v}')">${label}</button>`
+  ).join('');
+}
+
+function setModeFilter(mode) {
+  document.getElementById('selMode').value = mode;
+  renderModeFilter();
+  runProfileSearch(false);
 }
 
 function timeAgo(epoch) {
@@ -1096,8 +1136,13 @@ function timeAgo(epoch) {
   return Math.floor(diff/86400) + 'd ago';
 }
 
-async function runProfileSearch() {
+async function runProfileSearch(resetMode = true) {
   closeDropdown();
+  if (resetMode) {
+    document.getElementById('selMode').value = 'all';
+    document.getElementById('selRegion').value = 'auto';
+    document.getElementById('modeFilter').style.display = 'none';
+  }
   let rid = document.getElementById('inpRiotId').value.trim();
   if (!rid.includes('#')) {
     document.getElementById('searchStatus').innerHTML = `<span style="color:var(--loss)">Formato invalido. Debes incluir el #TAG (ej. EL LUIS#1069)</span>`;
@@ -1107,11 +1152,11 @@ async function runProfileSearch() {
   let region = document.getElementById('selRegion').value;
   let mode = document.getElementById('selMode').value;
 
-  addRecentPlayer(`${name.trim()}#${tag.trim()}`, region);
+  addRecentPlayer(`${name.trim()}#${tag.trim()}`, 'auto');
 
   let btn = document.getElementById('btnSearch');
   btn.disabled = true; btn.innerText = 'Consultando...';
-  document.getElementById('searchStatus').innerHTML = `<span style="color:var(--cyan)">Consultando datos de ${name}#${tag} (${region.toUpperCase()})...</span>`;
+  document.getElementById('searchStatus').innerHTML = `<span style="color:var(--cyan)">Buscando a ${name}#${tag} en todas las regiones...${mode !== 'all' ? ' (filtro: ' + mode + ')' : ''}</span>`;
   document.getElementById('matchesContainer').innerHTML = '';
 
   try {
@@ -1123,6 +1168,8 @@ async function runProfileSearch() {
       document.getElementById('searchStatus').innerHTML = `<span style="color:var(--loss)">${data.error}</span>`;
       return;
     }
+    document.getElementById('selRegion').value = data.region || 'auto';
+    renderModeFilter();
     renderProfileData(data);
   } catch (e) {
     btn.disabled = false; btn.innerText = 'Buscar Perfil';
@@ -1400,10 +1447,10 @@ class TrackerLocalHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/profile":
             q = parse_qs(parsed.query)
-            region = q.get("region", ["latam"])[0]
+            region = q.get("region", ["auto"])[0]
             name = q.get("name", [""])[0]
             tag = q.get("tag", [""])[0]
-            mode = q.get("mode", ["competitive"])[0]
+            mode = q.get("mode", ["all"])[0]
             self._send_json(ENGINE.search_player_profile(region, name, tag, mode))
             return
 

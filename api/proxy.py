@@ -74,14 +74,25 @@ def compact_matches_payload(payload: dict) -> dict:
             continue
 
         rounds = match.get("rounds") or []
-        all_players = match.get("players", {}).get("all_players", [])
+        players_obj = match.get("players")
+        if isinstance(players_obj, dict):
+            all_players = players_obj.get("all_players") or []
+        elif isinstance(players_obj, list):
+            all_players = players_obj
+        else:
+            all_players = []
+        all_players = [p for p in all_players if isinstance(p, dict)]
 
         multikills_by_puuid = {}
         rounds_with_contribution = {}
 
         for r in rounds:
+            if not isinstance(r, dict):
+                continue
             player_stats = r.get("player_stats") or []
             for ps in player_stats:
+                if not isinstance(ps, dict):
+                    continue
                 puuid = ps.get("player_puuid")
                 if not puuid:
                     continue
@@ -97,14 +108,16 @@ def compact_matches_payload(payload: dict) -> dict:
                 elif k_count >= 5:
                     mk["5k"] += 1
 
-                if k_count > 0 or ps.get("damage", 0) >= 50:
+                dmg = ps.get("damage")
+                dmg = dmg if isinstance(dmg, (int, float)) else 0
+                if k_count > 0 or dmg >= 50:
                     rounds_with_contribution[puuid] = rounds_with_contribution.get(puuid, 0) + 1
 
         compact_players = []
         for p in all_players:
             puuid = p.get("puuid", "")
-            assets = p.get("assets", {})
-            agent_assets = assets.get("agent", {})
+            assets = p.get("assets") or {}
+            agent_assets = assets.get("agent") or {}
             compact_players.append({
                 "puuid": puuid,
                 "name": p.get("name", ""),
@@ -115,13 +128,15 @@ def compact_matches_payload(payload: dict) -> dict:
                 "currenttier_patched": p.get("currenttier_patched", "Unranked"),
                 "damage_made": p.get("damage_made", 0),
                 "damage_received": p.get("damage_received", 0),
-                "stats": p.get("stats", {}),
+                "stats": p.get("stats") or {},
                 "agent_icon": agent_assets.get("small", ""),
                 "multikills": multikills_by_puuid.get(puuid, {"3k": 0, "4k": 0, "5k": 0}),
                 "impact_rounds": rounds_with_contribution.get(puuid, 0),
             })
 
-        meta = match.get("metadata", {})
+        meta = match.get("metadata")
+        if not isinstance(meta, dict):
+            continue
         compacted_matches.append({
             "metadata": {
                 "map": meta.get("map", "Unknown"),
@@ -133,7 +148,7 @@ def compact_matches_payload(payload: dict) -> dict:
                 "matchid": meta.get("matchid", ""),
                 "cluster": meta.get("cluster", ""),
             },
-            "teams": match.get("teams", {}),
+            "teams": match.get("teams") or {},
             "players": {"all_players": compact_players},
         })
 
@@ -176,6 +191,19 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        try:
+            self._handle_get()
+        except Exception as e:
+            tb = e.__traceback__
+            while tb is not None and tb.tb_next is not None:
+                tb = tb.tb_next
+            where = f" (linea {tb.tb_lineno})" if tb is not None else ""
+            try:
+                self._send_json(500, {"error": f"Error interno del proxy: {type(e).__name__}: {e}{where}"}, 0)
+            except Exception:
+                pass
+
+    def _handle_get(self):
         parsed_path = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed_path.query)
 
